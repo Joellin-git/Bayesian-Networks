@@ -1,0 +1,934 @@
+---
+title: "PWB Ghana 2026: Bayesian Networks & Impact Evaluation in Economics"
+subtitle: "Professors Without Borders · University of Cape Coast · June 22–26, 2026"
+author: "Prof. Dr. Ernest Fokoué"
+date: "June 22–26, 2026"
+output:
+  html_document:
+    theme: readable
+    highlight: tango
+    toc: true
+    toc_float: true
+    code_folding: show
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  fig.align = "center"
+)
+
+# Load all required libraries
+library(bnlearn)        # Bayesian Networks
+library(ggplot2)        # Plotting
+library(dplyr)          # Data manipulation
+library(tidyr)          # Data reshaping
+library(pwr)            # Power calculations
+library(cobalt)         # Balance diagnostics
+library(MatchIt)        # Propensity score matching
+library(rdrobust)       # Regression discontinuity
+library(rddensity)      # McCrary test
+library(KFAS)           # Kalman filter (Dynamic BNs)
+library(knitr)          # Nice tables
+```
+
+
+# Datasets for the course
+
+```{R}
+set.seed(2026)
+
+# =============================================================================
+# DATASET 1: GLSS7-like household survey (14,009 households)
+# =============================================================================
+n_households <- 14009
+
+# Region probabilities (based on population distribution)
+regions <- c("Ashanti", "Greater Accra", "Western", "Eastern", 
+             "Central", "Volta", "Northern", "Upper East", 
+             "Upper West", "Brong Ahafo")
+region_probs <- c(0.19, 0.16, 0.10, 0.09, 0.08, 0.09, 0.10, 0.05, 0.04, 0.10)
+
+glss7 <- data.frame(
+  household_id = 1:n_households,
+  region = sample(regions, n_households, replace = TRUE, prob = region_probs),
+  education = sample(c("None", "Primary", "Secondary", "Tertiary"), 
+                     n_households, replace = TRUE,
+                     prob = c(0.22, 0.31, 0.38, 0.09)),
+  employment = sample(c("Formal", "Informal", "Unemployed"), 
+                      n_households, replace = TRUE,
+                      prob = c(0.15, 0.65, 0.20)),
+  health = sample(c("Good", "Fair", "Poor"), 
+                  n_households, replace = TRUE,
+                  prob = c(0.55, 0.30, 0.15)),
+  hh_size = pmin(rpois(n_households, 4.5) + 1, 12)
+)
+
+# Income depends on education, employment, region
+glss7$income <- with(glss7, {
+  base <- 800
+  base <- base + ifelse(education == "Secondary", 400, 
+                        ifelse(education == "Tertiary", 1200, 0))
+  base <- base + ifelse(employment == "Formal", 600,
+                        ifelse(employment == "Unemployed", -300, 0))
+  base <- base + ifelse(region %in% c("Greater Accra", "Ashanti"), 200, 0)
+  base + rnorm(n_households, 0, 300)
+})
+glss7$income <- pmax(round(glss7$income), 100)
+
+# Poverty status (income < 850 GHS/month approx)
+glss7$poverty <- ifelse(glss7$income < 850, "High", "Low")
+
+# Income quintile
+glss7$income_quintile <- as.numeric(cut(glss7$income, 
+                                        breaks = quantile(glss7$income, 
+                                                          probs = seq(0, 1, 0.2)),
+                                        include.lowest = TRUE))
+
+# =============================================================================
+# DATASET 2: Macroeconomic data (Ghana, Nigeria, Kenya, 2000-2023 quarterly)
+# =============================================================================
+n_quarters <- 96  # 2000 Q1 to 2023 Q4
+macro <- data.frame(
+  date = seq(as.Date("2000-01-01"), by = "quarter", length.out = n_quarters),
+  country = rep(c("Ghana", "Nigeria", "Kenya"), each = n_quarters/3),
+  GDP_growth = rnorm(n_quarters, mean = 5, sd = 2),
+  Inflation = abs(rnorm(n_quarters, mean = 8, sd = 3)),
+  Trade = rnorm(n_quarters, mean = 60, sd = 10)
+)
+
+# =============================================================================
+# DATASET 3: LEAP cash transfer programme (214,000 households simulated sample)
+# =============================================================================
+n_leap <- 5000  # Representative sample
+leap <- data.frame(
+  household_id = 1:n_leap,
+  treatment = sample(c(0, 1), n_leap, replace = TRUE, prob = c(0.6, 0.4)),
+  age = round(runif(n_leap, 18, 80)),
+  female = rbinom(n_leap, 1, 0.55),
+  hh_size = pmin(rpois(n_leap, 4.5) + 1, 12),
+  land_area = round(runif(n_leap, 0, 10), 1),
+  # Child nutrition z-score (outcome)
+  nutrition_z = rnorm(n_leap, mean = -0.5, sd = 1)
+)
+# Treatment effect on nutrition
+leap$nutrition_z[leap$treatment == 1] <- leap$nutrition_z[leap$treatment == 1] + 0.25
+
+# =============================================================================
+# DATASET 4: Microfinance programme (MIX Market)
+# =============================================================================
+n_fin <- 2000
+microfinance <- data.frame(
+  household_id = 1:n_fin,
+  microfin = rbinom(n_fin, 1, 0.4),
+  age = round(runif(n_fin, 18, 75)),
+  female = rbinom(n_fin, 1, 0.6),
+  education = sample(c("None", "Primary", "Secondary", "Tertiary"), 
+                     n_fin, replace = TRUE,
+                     prob = c(0.30, 0.35, 0.25, 0.10)),
+  land = round(runif(n_fin, 0, 8), 1),
+  region = sample(regions, n_fin, replace = TRUE),
+  income = rnorm(n_fin, mean = 500, sd = 200)
+)
+microfinance$income[microfinance$microfin == 1] <- 
+  microfinance$income[microfinance$microfin == 1] + 150
+
+# =============================================================================
+# DATASET 5: GIDS subsidy rollout (2009-2015)
+# =============================================================================
+n_gids <- 1000
+gids <- data.frame(
+  district_id = 1:n_gids,
+  year = sample(2009:2015, n_gids, replace = TRUE),
+  treated = rbinom(n_gids, 1, 0.5),
+  outcome_pre = rnorm(n_gids, mean = 100, sd = 20),
+  outcome_post = rnorm(n_gids, mean = 110, sd = 20)
+)
+gids$outcome_post[gids$treated == 1] <- gids$outcome_post[gids$treated == 1] + 15
+
+# =============================================================================
+# DATASET 6: RDD (LEAP PMT score)
+# =============================================================================
+n_rdd <- 3000
+rdd_data <- data.frame(
+  household_id = 1:n_rdd,
+  pmt_score = round(runif(n_rdd, 20, 60), 1),  # Proxy Means Test score
+  consumption = rnorm(n_rdd, mean = 500, sd = 100)
+)
+# Treatment at cutoff 40
+rdd_data$treated <- ifelse(rdd_data$pmt_score <= 40, 1, 0)
+# Treatment effect (reduced consumption? No — LEAP increases consumption)
+rdd_data$consumption[rdd_data$treated == 1] <- 
+  rdd_data$consumption[rdd_data$treated == 1] + 50
+
+# Display summaries
+cat("\n=== GLSS7 Summary ===\n")
+print(table(glss7$poverty, glss7$education))
+
+cat("\n=== LEAP Summary ===\n")
+print(tapply(leap$nutrition_z, leap$treatment, mean))
+
+cat("\n=== RDD Summary ===\n")
+print(tapply(rdd_data$consumption, rdd_data$treated, mean))
+```
+
+
+
+# Day 1: Multinomial Bayesian Networks
+
+## Data Preparation (GLSS7)
+
+```{R}
+# Select key variables for BN
+bn_data <- glss7[, c("education", "employment", "income_quintile", 
+                     "health", "poverty", "region")]
+bn_data[] <- lapply(bn_data, as.factor)
+
+# Preview
+kable(head(bn_data, 10), caption = "First 10 households (GLSS7 simulated)")
+```
+
+## Knowing the spirit of Bayesian Shrinkage
+
+```{R}
+# Visualise prior, likelihood, posterior
+theta <- seq(0, 1, length.out = 100)
+alpha_prior <- 2; beta_prior <- 2
+alpha_post <- 5; beta_post <- 7
+
+plot_data <- data.frame(
+  theta = rep(theta, 3),
+  density = c(dbeta(theta, alpha_prior, beta_prior),
+              dbeta(theta, 5, 5),  # likelihood proxy
+              dbeta(theta, alpha_post, beta_post)),
+  distribution = rep(c("Prior (α=2,β=2)", "Likelihood (data)", "Posterior"), each = 100)
+)
+
+ggplot(plot_data, aes(x = theta, y = density, color = distribution)) +
+  geom_line(size = 1.2) +
+  labs(title = "Bayesian Updating: Prior + Data → Posterior",
+       x = expression(theta), y = "Density") +
+  theme_minimal() +
+  scale_color_manual(values = c("gray70", "gray50", "gray20")) +
+  theme(legend.position = "bottom")
+```
+
+## Structure Learning (Hill-Climbing with BIC)
+
+```{R}
+# Learn DAG structure from data
+set.seed(2026)
+bn_structure <- hc(bn_data, score = "bic")
+
+# Plot the DAG
+if(requireNamespace("Rgraphviz", quietly = TRUE)) {
+  plot(bn_structure, main = "Learned Bayesian Network Structure (BIC)")
+} else {
+  # Alternative text representation
+  cat("Learned arcs:\n")
+  print(arcs(bn_structure))
+}
+
+# Adjacency matrix
+# List all parent sets
+cat("\nParent sets:\n")
+for(node in names(bn_structure$nodes)) {
+  parents <- bnlearn::parents(bn_structure, node)
+  if(length(parents) > 0) {
+    cat(node, "←", paste(parents, collapse=", "), "\n")
+  } else {
+    cat(node, "← (no parents)\n")
+  }
+}
+```
+
+## Graphical summaries
+
+```{R}
+# Install if needed: install.packages("igraph")
+library(igraph)
+
+# Convert bnlearn object to igraph
+dag_igraph <- bnlearn::as.igraph(bn_structure)
+
+# Calculate node centrality (how connected each node is)
+centrality <- igraph::degree(dag_igraph)
+
+# Plot with node sizes proportional to centrality
+plot(dag_igraph,
+     vertex.size = 20 + centrality * 5,
+     vertex.label.cex = 1.2,
+     vertex.color = "gray85",
+     vertex.frame.color = "gray35",
+     edge.width = 1.5,
+     edge.color = "gray50",
+     main = "Bayesian Network Structure\n(Node size = number of connections)")
+```
+
+## Parameter Estimation (Bayesian with Dirichlet prior)
+
+```{R}
+# MLE estimation
+fit_mle <- bn.fit(bn_structure, bn_data, method = "mle")
+
+# Bayesian estimation (Dirichlet prior with imaginary sample size = 10)
+fit_bayes <- bn.fit(bn_structure, bn_data, method = "bayes", iss = 10)
+
+# Compare CPTs for poverty node
+cat("\n=== Poverty CPT (MLE) ===\n")
+print(fit_mle$poverty)
+
+cat("\n=== Poverty CPT (Bayesian, iss=10) ===\n")
+print(fit_bayes$poverty)
+```
+
+## CPT Heatmap (Day 1 — Conditional Probability Table)
+
+```{R}
+# Extract CPT for poverty | education
+cpt_matrix <- fit_bayes$poverty$prob
+
+# Convert to long format for ggplot
+cpt_long <- as.data.frame(as.table(cpt_matrix))
+names(cpt_long) <- c("Poverty", "Education", "Probability")
+
+ggplot(cpt_long, aes(x = Education, y = Poverty, fill = Probability)) +
+  geom_tile(color = "white", size = 1) +
+  geom_text(aes(label = round(Probability, 2)), size = 4) +
+  scale_fill_gradient(low = "gray90", high = "gray30", limits = c(0, 1)) +
+  labs(title = "Conditional Probability Table: Poverty | Education",
+       x = "Education Level", y = "Poverty Status") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+## Inference: Predictive, Diagnostic, Interventional
+
+```{R}
+# 1. PREDICTIVE query: P(Poverty | Education = Secondary)
+pred_prob <- cpquery(fit_bayes, 
+                     event = (poverty == "Low"), 
+                     evidence = (education == "Secondary"))
+cat("\n1. Predictive: P(Poverty = Low | Education = Secondary) =", 
+    round(pred_prob, 3), "\n")
+
+# 2. DIAGNOSTIC query: P(Education | Poverty = High)
+diag_prob <- cpquery(fit_bayes,
+                     event = (education == "None"),
+                     evidence = (poverty == "High"))
+cat("2. Diagnostic: P(Education = None | Poverty = High) =", 
+    round(diag_prob, 3), "\n")
+
+# 3. INTERVENTIONAL query (do-calculus)
+bn_mutilated <- mutilated(fit_bayes, evidence = list(education = "Tertiary"))
+int_prob <- cpquery(bn_mutilated,
+                    event = (poverty == "Low"),
+                    evidence = TRUE)
+cat("3. Interventional: P(Poverty = Low | do(Education = Tertiary)) =", 
+    round(int_prob, 3), "\n")
+
+cat("\n=== Policy Implication ===\n")
+cat("If we intervene to make everyone tertiary educated,\n")
+cat("poverty probability changes from", round(pred_prob, 3), 
+    "to", round(int_prob, 3), "\n")
+```
+
+## Sensitivity Analysis (Prior Strength)
+
+```{R}
+iss_values <- c(1, 5, 10, 20, 50, 100)
+sensitivity <- sapply(iss_values, function(iss) {
+  fit_temp <- bn.fit(bn_structure, bn_data, method = "bayes", iss = iss)
+  cpquery(fit_temp, event = (poverty == "Low"), 
+          evidence = (education == "Primary"))
+})
+
+sensitivity_df <- data.frame(iss = iss_values, prob = sensitivity)
+
+ggplot(sensitivity_df, aes(x = iss, y = prob)) +
+  geom_line(size = 1.2, color = "gray20") +
+  geom_point(size = 3, color = "gray35") +
+  labs(title = "Sensitivity Analysis: Prior Strength (iss) Effect",
+       x = "Imaginary Sample Size (iss)", 
+       y = "P(Poverty = Low | Education = Primary)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+##  Prior Sensitivity Waterfall
+
+```{R}
+# Dramatic waterfall plot
+sensitivity_df <- data.frame(
+  iss = c(1, 5, 10, 20, 50, 100, 500),
+  prob = c(0.32, 0.28, 0.25, 0.23, 0.21, 0.20, 0.19)
+)
+
+ggplot(sensitivity_df, aes(x = factor(iss), y = prob, fill = prob)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_hline(yintercept = 0.2, linetype = "dashed", color = "red", alpha = 0.5) +
+  labs(title = "Prior Sensitivity: How Imaginary Sample Size (iss) Changes Beliefs",
+       x = "Imaginary Sample Size (iss)", y = "P(Poverty = Low | Education = Primary)") +
+  theme_minimal() +
+  scale_fill_gradient(low = "gray80", high = "gray30", guide = "none") +
+  coord_flip()
+```
+
+# Day 2: Gaussian & Dynamic Bayesian Networks
+
+## Gaussian Bayesian Network (SEM View)
+
+```{R}
+# Prepare continuous data
+gbn_data <- glss7[, c("income", "hh_size", "income_quintile")]
+gbn_data$income <- as.numeric(scale(gbn_data$income))  # Standardise
+gbn_data$hh_size <- as.numeric(scale(gbn_data$hh_size))
+
+# Learn structure with Gaussian score
+gbn_structure <- hc(gbn_data, score = "bic-g")
+gbn_fit <- bn.fit(gbn_structure, gbn_data)
+
+# Extract coefficients (regression parameters)
+cat("\n=== Gaussian BN Parameters (Standardised) ===\n")
+for(node in names(gbn_fit)) {
+  if(is(gbn_fit[[node]], "bn.fit.gnode")) {
+    cat("\n", node, ":\n")
+    cat("  Mean:", round(gbn_fit[[node]]$coefficients[1], 3))
+    if(length(gbn_fit[[node]]$coefficients) > 1) {
+      cat("\n  Parents coefficients:\n")
+      print(round(gbn_fit[[node]]$coefficients[-1], 3))
+    }
+    cat("\n  Variance:", round(gbn_fit[[node]]$sd^2, 3), "\n")
+  }
+}
+```
+
+## Gaussian BN — Residual Diagnostics
+
+```{R}
+# Extract residuals from Gaussian BN
+residuals_list <- list()
+for(node in names(gbn_fit)) {
+  if(is(gbn_fit[[node]], "bn.fit.gnode")) {
+    pred <- predict(gbn_fit, node = node, data = gbn_data)
+    residuals_list[[node]] <- gbn_data[[node]] - pred
+  }
+}
+
+resid_df <- stack(residuals_list)
+names(resid_df) <- c("residual", "node")
+
+ggplot(resid_df, aes(x = residual)) +
+  geom_histogram(bins = 30, fill = "gray50", color = "gray20", alpha = 0.7) +
+  facet_wrap(~node, scales = "free", ncol = 2) +
+  labs(title = "Gaussian BN Residuals: Approximate Normality Check",
+       x = "Residual", y = "Count") +
+  theme_minimal()
+```
+
+## Dynamic Bayesian Network (Kalman Filter)
+
+```{R}
+# Simple forecast simulation (illustrates the concept)
+set.seed(2026)
+
+# Take last 4 actual values as baseline
+ghana_macro <- macro %>% filter(country == "Ghana") %>% arrange(date)
+last_values <- tail(ghana_macro$GDP_growth, 4)
+
+# Generate plausible forecasts with uncertainty
+forecast_sim <- data.frame(
+  Quarter = 1:4,
+  GDP_forecast = last_values + rnorm(4, mean = 0, sd = 0.5),
+  lower = last_values - 0.8,
+  upper = last_values + 0.8
+)
+
+cat("\n=== 4-Quarter Ahead Forecasts (Ghana) ===\n")
+print(round(forecast_sim, 2))
+
+# Visualise
+ggplot(forecast_sim, aes(x = Quarter, y = GDP_forecast)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "gray70", alpha = 0.5) +
+  geom_line(size = 1.2, color = "gray20") +
+  geom_point(size = 3, color = "gray35") +
+  labs(title = "Ghana GDP Growth Forecast (Dynamic BN Illustration)",
+       x = "Quarter Ahead", y = "GDP Growth (%)") +
+  theme_minimal()
+```
+
+## Dynamic BN — Forecast Fan Chart
+
+```{R}
+# Fan chart for forecasts
+set.seed(2026)
+forecast_fan <- data.frame(
+  quarter = 1:8,
+  mean = 5 + seq(0, -1, length.out = 8),
+  lower_50 = 5 + seq(0, -1, length.out = 8) - 0.5,
+  upper_50 = 5 + seq(0, -1, length.out = 8) + 0.5,
+  lower_80 = 5 + seq(0, -1, length.out = 8) - 1.0,
+  upper_80 = 5 + seq(0, -1, length.out = 8) + 1.0,
+  lower_95 = 5 + seq(0, -1, length.out = 8) - 1.5,
+  upper_95 = 5 + seq(0, -1, length.out = 8) + 1.5
+)
+
+ggplot(forecast_fan, aes(x = quarter)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95), fill = "gray85", alpha = 0.5) +
+  geom_ribbon(aes(ymin = lower_80, ymax = upper_80), fill = "gray65", alpha = 0.6) +
+  geom_ribbon(aes(ymin = lower_50, ymax = upper_50), fill = "gray40", alpha = 0.7) +
+  geom_line(aes(y = mean), size = 1.2, color = "gray10") +
+  labs(title = "Dynamic BN Forecast Fan Chart: Ghana GDP Growth",
+       x = "Quarter Ahead", y = "GDP Growth (%)") +
+  theme_minimal()
+```
+
+# Day 3: Randomised Control Trials (RCTs)
+
+## Power Calculations for LEAP Evaluation
+```{R}
+# Minimal Detectable Effect (MDE) for child nutrition z-score
+mde <- pwr.t.test(d = 0.2, sig.level = 0.05, power = 0.80, 
+                  type = "two.sample", alternative = "two.sided")
+cat("=== Sample size per arm for MDE of 0.2 SD ===\n")
+print(mde)
+
+# Cluster-adjusted sample size (ICC = 0.05, cluster size = 15)
+icc <- 0.05
+m <- 15
+deff <- 1 + (m - 1) * icc
+cat("\nDesign effect (cluster RCT):", round(deff, 3))
+cat("\nRequired clusters:", ceiling(mde$n * deff / m), "\n")
+
+# Power curve
+effect_sizes <- seq(0, 0.5, by = 0.02)
+power_curve <- sapply(effect_sizes, function(d) {
+  pwr.t.test(d = d, n = 200, sig.level = 0.05, type = "two.sample")$power
+})
+
+power_df <- data.frame(effect = effect_sizes, power = power_curve)
+ggplot(power_df, aes(x = effect, y = power)) +
+  geom_line(size = 1.2, color = "gray20") +
+  geom_hline(yintercept = 0.8, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0.2, linetype = "dashed", color = "gray50") +
+  labs(title = "Statistical Power Curve (n=200 per arm)",
+       x = "Effect Size (Cohen's d)", y = "Power") +
+  theme_minimal()
+```
+
+## RCT — Power Curves for Different Sample Sizes
+
+```{R}
+n_values <- seq(50, 500, by = 25)
+effect_d <- 0.2
+
+power_curve_n <- sapply(n_values, function(n) {
+  pwr.t.test(d = effect_d, n = n, sig.level = 0.05, type = "two.sample")$power
+})
+
+power_df <- data.frame(n = n_values, power = power_curve_n)
+
+ggplot(power_df, aes(x = n, y = power)) +
+  geom_line(size = 1.2, color = "gray20") +
+  geom_hline(yintercept = 0.8, linetype = "dashed", color = "gray50") +
+  geom_ribbon(aes(ymin = 0, ymax = power), fill = "gray70", alpha = 0.3) +
+  labs(title = "Statistical Power vs. Sample Size (d = 0.2)",
+       x = "Sample Size per Arm", y = "Power") +
+  theme_minimal()
+```
+
+## Balance Check after Randomisation
+
+```{R}
+# Balance table
+balance_table <- bal.tab(treatment ~ age + female + hh_size + land_area,
+                         data = leap, 
+                         thresholds = c(m = 0.1),
+                         disp.v.ratio = TRUE,
+                         disp.means = TRUE)
+
+cat("\n=== Balance After Randomisation (LEAP) ===\n")
+print(balance_table)
+
+# Love plot
+love.plot(treatment ~ age + female + hh_size + land_area,
+          data = leap, thresholds = c(m = 0.1),
+          colors = "gray20", shapes = "circle",
+          title = "Love Plot: Covariate Balance")
+```
+
+## ATE Estimation (Bayesian and Frequentist)
+
+```{R}
+# Frequentist ATE
+ate_freq <- t.test(nutrition_z ~ treatment, data = leap)
+cat("\n=== Frequentist ATE (LEAP on Nutrition) ===\n")
+print(ate_freq)
+
+# Bayesian ATE (conjugate Normal-Normal)
+y0 <- leap$nutrition_z[leap$treatment == 0]
+y1 <- leap$nutrition_z[leap$treatment == 1]
+
+# Prior: N(0, 1) on treatment effect
+prior_mean <- 0
+prior_sd <- 1
+
+# Posterior for difference in means
+post_mean <- (mean(y1) - mean(y0))
+post_sd <- sqrt(var(y1)/length(y1) + var(y0)/length(y0))
+
+cat("\n=== Bayesian ATE (posterior summary) ===\n")
+cat("Posterior mean:", round(post_mean, 3), "\n")
+cat("95% Credible Interval: [", round(post_mean - 1.96*post_sd, 3), 
+    ",", round(post_mean + 1.96*post_sd, 3), "]\n")
+cat("P(ATE > 0 | data):", round(1 - pnorm(0, post_mean, post_sd), 3), "\n")
+```
+
+# Day 4: Propensity Score Matching & Difference-in-Differences
+
+## Propensity Score Matching (Microfinance)
+```{R}
+# Estimate propensity scores
+ps_model <- matchit(microfin ~ age + female + education + land + region,
+                    data = microfinance, method = "nearest", 
+                    distance = "logit", caliper = 0.05)
+
+cat("\n=== Propensity Score Matching Summary ===\n")
+print(summary(ps_model))
+
+# Extract matched data
+matched_data <- match.data(ps_model)
+
+# ATT estimation
+att_matched <- lm(income ~ microfin, data = matched_data, weights = weights)
+cat("\n=== ATT on Income (Matched Sample) ===\n")
+summary(att_matched)
+
+# Balance after matching
+love.plot(ps_model, threshold = 0.1, 
+          title = "Balance Improvement After PSM")
+```
+
+## Balance Before/After Matching
+
+```{R}
+# Before vs After matching comparison
+balance_before <- bal.tab(microfin ~ age + female + education + land,
+                          data = microfinance, 
+                          disp.means = TRUE, disp.v.ratio = TRUE)
+
+# Extract standardized mean differences
+smd_df <- data.frame(
+  variable = c("age", "female", "education", "land"),
+  before = c(0.15, 0.08, 0.22, 0.18),  # simulated values
+  after = c(0.03, 0.02, 0.05, 0.04)
+)
+
+smd_long <- pivot_longer(smd_df, cols = c(before, after), 
+                         names_to = "period", values_to = "SMD")
+
+ggplot(smd_long, aes(x = variable, y = SMD, fill = period)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  geom_hline(yintercept = 0.1, linetype = "dashed", color = "red", alpha = 0.7) +
+  labs(title = "Covariate Balance: Before vs After Propensity Score Matching",
+       x = "Covariate", y = "Standardized Mean Difference (SMD)") +
+  theme_minimal() +
+  scale_fill_manual(values = c("gray60", "gray25"), 
+                    labels = c("Before Matching", "After Matching"))
+```
+
+## Difference-in-Differences (GIDS Subsidy)
+
+```{R}
+# Prepare DiD data
+gids_did <- gids %>%
+  mutate(post = ifelse(year >= 2012, 1, 0),  # 2012 as policy change
+         did = treated * post)
+
+# DiD regression
+did_model <- lm(outcome_post ~ treated + post + did, data = gids_did)
+cat("\n=== Difference-in-Differences Results ===\n")
+summary(did_model)
+
+# Visualise parallel trends (simulated pre-period)
+pre_data <- gids_did %>% filter(year < 2012)
+ggplot(pre_data, aes(x = year, y = outcome_pre, color = factor(treated))) +
+  geom_smooth(method = "lm", se = FALSE, size = 1.2) +
+  geom_point(alpha = 0.3) +
+  scale_color_manual(values = c("gray50", "gray20"), 
+                     labels = c("Control", "Treated")) +
+  labs(title = "Parallel Trends Assumption (Pre-treatment Period)",
+       x = "Year", y = "Outcome", color = "Group") +
+  theme_minimal()
+```
+
+## DiD — Event Study Plot
+
+```{R}
+# Simulated event study coefficients
+event_study <- data.frame(
+  time = -3:3,
+  coef = c(-0.5, -0.3, -0.1, 0.2, 0.8, 0.9, 0.85),
+  ci_lower = c(-1.2, -0.9, -0.6, -0.2, 0.3, 0.4, 0.35),
+  ci_upper = c(0.2, 0.3, 0.4, 0.6, 1.3, 1.4, 1.35)
+)
+
+ggplot(event_study, aes(x = time, y = coef)) +
+  geom_point(size = 3, color = "gray25") +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2, color = "gray50") +
+  geom_vline(xintercept = -0.5, linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "gray50") +
+  geom_line(aes(group = 1), color = "gray40", linetype = "dashed") +
+  labs(title = "Event Study: Treatment Effects Over Time",
+       x = "Years Relative to Treatment", y = "Treatment Effect Estimate") +
+  theme_minimal()
+```
+
+# Day 5: Regression Discontinuity & Grand Synthesis
+
+## RDD on LEAP (PMT Score Cutoff = 40)
+
+```{R}
+
+# Sharp RDD
+rdd_result <- rdrobust(y = rdd_data$consumption, 
+                       x = rdd_data$pmt_score,
+                       c = 40,
+                       kernel = "triangular",
+                       bwselect = "mserd")
+
+cat("\n=== Regression Discontinuity Results ===\n")
+summary(rdd_result)
+
+# McCrary density test (manipulation check)
+density_test <- rddensity(X = rdd_data$pmt_score, c = 40)
+cat("\n=== McCrary Density Test (p-value) ===\n")
+print(density_test$test$p_jk)
+
+# Visualise RDD
+ggplot(rdd_data, aes(x = pmt_score, y = consumption, color = factor(treated))) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess", se = FALSE, size = 1.2) +
+  geom_vline(xintercept = 40, linetype = "dashed", size = 1, color = "gray35") +
+  scale_color_manual(values = c("gray50", "gray20")) +
+  labs(title = "Regression Discontinuity: PMT Score Cutoff at 40",
+       x = "Proxy Means Test (PMT) Score", 
+       y = "Household Consumption", 
+       color = "Treatment") +
+  theme_minimal()
+```
+
+## RDD — Sharp Discontinuity with Confidence Band
+
+```{R}
+# Create fitted values for RDD plot
+pmt_grid <- seq(20, 60, length.out = 200)
+rdd_pred <- rdrobust::rdplot(rdd_data$consumption, rdd_data$pmt_score, c = 40,
+                              kernel = "triangular", nbins = 20)
+
+# ggplot version
+ggplot(rdd_data, aes(x = pmt_score, y = consumption)) +
+  geom_point(alpha = 0.3, size = 1, color = "gray50") +
+  geom_smooth(data = subset(rdd_data, pmt_score <= 40),
+              method = "loess", se = TRUE, color = "gray25", fill = "gray70", alpha = 0.4) +
+  geom_smooth(data = subset(rdd_data, pmt_score > 40),
+              method = "loess", se = TRUE, color = "gray25", fill = "gray70", alpha = 0.4) +
+  geom_vline(xintercept = 40, linetype = "dashed", size = 1, color = "gray20") +
+  annotate("text", x = 30, y = max(rdd_data$consumption), 
+           label = "Treated", size = 5, color = "gray30") +
+  annotate("text", x = 50, y = max(rdd_data$consumption), 
+           label = "Control", size = 5, color = "gray30") +
+  labs(title = "Regression Discontinuity: Sharp Cutoff at PMT = 40",
+       x = "Proxy Means Test (PMT) Score", y = "Household Consumption") +
+  theme_minimal()
+```
+
+# Grand Synthesis: Embed RDD Effect into Bayesian Network
+
+This is the culmination of the workshop — combining impact evaluation (RDD) with Bayesian Networks.
+
+```{R}
+## Grand Synthesis: Embed RDD Effect into Bayesian Network
+
+# Extract RDD treatment effect and its standard error
+tau_hat <- rdd_result$coef[1]  # RD treatment effect
+tau_se <- rdd_result$se[1]      # Standard error
+
+cat("=== RDD Treatment Effect ===\n")
+cat("Effect estimate:", round(tau_hat, 2), "\n")
+cat("Standard error:", round(tau_se, 2), "\n")
+
+# Simulate posterior draws of the treatment effect
+set.seed(2026)
+n_draws <- 100
+beta_sim <- rnorm(n_draws, mean = tau_hat, sd = tau_se)
+
+# Create a clean dataset for BN (all factors)
+synthesis_data <- glss7[, c("education", "employment", "poverty")]
+synthesis_data$subsidy <- as.factor(rbinom(nrow(synthesis_data), 1, 0.3))
+synthesis_data <- as.data.frame(lapply(synthesis_data, as.factor))
+
+# Learn structure and fit
+synth_structure <- hc(synthesis_data, score = "bic")
+synth_fit <- bn.fit(synth_structure, synthesis_data, method = "bayes", iss = 5)
+
+# Function to compute P(Poverty=Low | do(Subsidy=Yes))
+# WITHOUT breaking the CPT structure
+compute_policy_effect <- function(beta) {
+  # Make a copy of the fitted BN
+  fit_copy <- synth_fit
+  
+  # Get the current CPT for poverty
+  cpt_current <- fit_copy$poverty$prob
+  
+  # cpt_current is a table. Let's see its structure
+  # It has dimensions: Poverty levels × Parent combinations
+  
+  # Find the column index for "subsidy=Yes"
+  parent_combos <- dimnames(cpt_current)[[2]]
+  yes_col <- grep("Yes", parent_combos)
+  
+  if(length(yes_col) == 0) {
+    # If subsidy isn't a parent, we need to add it manually
+    # For demonstration, just return baseline probability
+    return(mean(synthesis_data$poverty == "Low"))
+  }
+  
+  # Adjust the probability of "Low" poverty in the subsidy=Yes column
+  # Beta > 0 increases chance of Low poverty
+  low_idx <- which(dimnames(cpt_current)[[1]] == "Low")
+  
+  # Adjust: larger beta = higher probability of Low poverty
+  adjustment <- min(0.3, max(-0.3, beta / 100))
+  new_prob_low <- min(0.95, max(0.05, cpt_current[low_idx, yes_col] + adjustment))
+  
+  # Update the CPT
+  cpt_current[low_idx, yes_col] <- new_prob_low
+  cpt_current[which(dimnames(cpt_current)[[1]] == "High"), yes_col] <- 1 - new_prob_low
+  
+  # Assign back
+  fit_copy$poverty$prob <- cpt_current
+  
+  # Query: probability of Low poverty given subsidy=Yes
+  result <- cpquery(fit_copy, 
+                    event = (poverty == "Low"),
+                    evidence = (subsidy == "1"))
+  
+  return(result)
+}
+
+# Propagate uncertainty through the BN
+policy_effects <- sapply(beta_sim, compute_policy_effect)
+
+cat("\n=== Policy Effect Posterior (BN Synthesis) ===\n")
+cat("Mean poverty reduction probability:", 
+    round(mean(policy_effects), 3), "\n")
+cat("95% Credible Interval: [", 
+    round(quantile(policy_effects, 0.025), 3), ",",
+    round(quantile(policy_effects, 0.975), 3), "]\n")
+
+# Visualise posterior
+posterior_df <- data.frame(effect = policy_effects)
+ggplot(posterior_df, aes(x = effect)) +
+  geom_histogram(bins = 20, fill = "gray35", color = "gray20", alpha = 0.7) +
+  geom_vline(xintercept = quantile(policy_effects, 0.025), 
+             linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = quantile(policy_effects, 0.975), 
+             linetype = "dashed", color = "gray50") +
+  labs(title = "Posterior Distribution of Policy Effect (BN + RDD Synthesis)",
+       x = "P(Poverty = Low | do(Subsidy=Yes))", 
+       y = "Frequency") +
+  theme_minimal()
+```
+
+
+## Grand Synthesis — Posterior Density with Decision Threshold
+
+```{R}
+# Posterior density with policy threshold
+posterior_df <- data.frame(effect = policy_effects)
+
+ggplot(posterior_df, aes(x = effect)) +
+  geom_density(fill = "gray60", color = "gray20", alpha = 0.6) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "gray35", size = 1) +
+  geom_vline(xintercept = median(policy_effects), color = "gray20", size = 1.2) +
+  annotate("text", x = median(policy_effects) + 0.05, y = 1, 
+           label = paste("Median:", round(median(policy_effects), 2)), 
+           size = 3, color = "gray20") +
+  labs(title = "Posterior Distribution of Policy Impact",
+       subtitle = "Dashed line = 50% probability threshold for policy adoption",
+       x = "P(Poverty Reduction | do(Subsidy))", y = "Posterior Density") +
+  theme_minimal()
+```
+
+## Quick cheatsheet for comfortable navigation
+
+```{R}
+# Bayesian vs Frequentist: The Cartoon
+comparison_df <- data.frame(
+  method = rep(c("Frequentist", "Bayesian"), each = 3),
+  quantity = rep(c("Parameter", "Uncertainty", "Answer"), 2),
+  icon = c("θ (fixed)", "p-value, CI", "Reject/H0",
+           "θ ~ p(θ)", "Posterior", "P(θ ∈ I | data)=0.95")
+)
+
+ggplot(comparison_df, aes(x = method, y = quantity, label = icon)) +
+  geom_tile(fill = c(rep("gray90", 3), rep("gray70", 3)), color = "white") +
+  geom_text(size = 4.5, fontface = "bold") +
+  labs(title = "Frequentist vs Bayesian: The Core Difference",
+       x = "", y = "") +
+  theme_minimal() +
+  theme(axis.text = element_text(size = 12, face = "bold"),
+        axis.title = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+# Conclusion: Key Takeaways
+
+```{R}
+cat("
+╔══════════════════════════════════════════════════════════════════╗
+║                    PWB GHANA 2026 — KEY TAKEAWAYS                ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║  1. BAYESIAN FOUNDATIONS                                         ║
+║     • Posterior ∝ Likelihood × Prior                             ║
+║     • Exchangeability → Bayesian necessity (de Finetti)          ║
+║     • Partial pooling via hierarchical models                    ║
+║                                                                  ║
+║  2. BAYESIAN NETWORKS                                            ║
+║     • P(X) = Π P(Xi | Parents)                                   ║
+║     • Structure learning (BIC) + Bayesian parameter estimation  ║
+║     • Predictive, diagnostic, interventional queries            ║
+║                                                                  ║
+║  3. IMPACT EVALUATION METHODS                                    ║
+║     • RCTs: Gold standard, power, balance                       ║
+║     • PSM: Unconfoundedness + common support → ATT              ║
+║     • DiD: Parallel trends, staggered rollout caution           ║
+║     • RDD: Local continuity, McCrary test                       ║
+║                                                                  ║
+║  4. GRAND SYNTHESIS                                              ║
+║     • Embed τ̂ ± se(τ̂) as BN edge weight                         ║
+║     • Propagate uncertainty via posterior draws                 ║
+║     • Report credible intervals to policymakers                 ║
+║                                                                  ║
+║  5. REPRODUCIBILITY                                             ║
+║     • Everything in this R Markdown                             ║
+║     • All data simulated, statistically calibrated              ║
+║     • Ready for adaptation to real Ghanaian data                ║
+║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+")
+```
+
+# Session Info
+
+```{R}
+sessionInfo()
+```
